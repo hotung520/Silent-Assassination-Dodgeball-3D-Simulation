@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>靜音暗殺躲避球 3D 動態模擬</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'PingFang HK', 'Microsoft JhengHei', sans-serif; background-color: #1a1a1a; }
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+            z-index: 10;
+        }
+        .info-panel {
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 5px solid #00ffcc;
+            pointer-events: auto;
+            max-width: 380px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+        }
+        .controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            pointer-events: auto;
+            z-index: 10;
+        }
+        button {
+            padding: 10px 20px;
+            background: #2c3e50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: 0.3s;
+            font-weight: bold;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        button:hover { background: #34495e; transform: scale(1.05); }
+        #scoreboard {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.85);
+            padding: 15px 25px;
+            border-radius: 8px;
+            text-align: center;
+            border: 2px solid white;
+            color: white;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+            z-index: 10;
+        }
+        .team-score { font-size: 28px; font-weight: bold; margin-bottom: 5px; }
+        .red { color: #ff4d4d; }
+        .blue { color: #4d94ff; }
+        #timer { font-size: 24px; color: #ffd700; font-family: monospace; font-weight: bold; }
+        #status-msg { margin-top: 10px; font-size: 15px; color: #00ffcc; font-weight: bold; min-height: 20px; }
+        canvas { display: block; position: absolute; top: 0; left: 0; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div class="info-panel">
+            <h2 style="margin-top:0; color: #00ffcc;">靜音暗殺躲避球</h2>
+            <p><strong>戰術與物理模擬已啟動</strong></p>
+            <p><strong>當前階段：</strong> <span id="phase-text" style="color:#ffd700;">第二階段：分組對抗</span></p>
+            <hr>
+            <ul style="padding-left: 20px; font-size: 0.9em; line-height: 1.6;">
+                <li><strong>嚴格邊界：</strong> 外場人員被鎖定在Ｕ型夾攻區內，無法進入內場。</li>
+                <li><strong>復活機制：</strong> 若外場球員成功擊中敵方內場，該外場球員將復活並回歸己方內場。</li>
+                <li><strong>真實物理：</strong> 躲避球具有彈跳反彈與摩擦力動能判定。</li>
+            </ul>
+            <small style="color:#888;">操作：滑鼠拖拽旋轉視角 / 滾輪縮放</small>
+        </div>
+    </div>
+
+    <div id="scoreboard">
+        <div class="team-score">
+            <span class="blue">藍 <span id="score-blue">0</span></span> : 
+            <span class="red"><span id="score-red">0</span> 紅</span>
+        </div>
+        <div id="timer">20:00</div>
+        <div id="status-msg">比賽準備中...</div>
+    </div>
+
+    <div class="controls">
+        <button onclick="toggleShrink()">切換：縮小邊界 (殊死戰)</button>
+        <button onclick="highlightTargets()" style="background: #c0392b;">揭曉：暗殺目標</button>
+        <button onclick="resetCamera()">重置視角</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        let scene, camera, renderer, clock;
+        let isShrunk = false;
+        let isMouseDown = false;
+        let mouseX = 0, mouseY = 0;
+        let targetRotationX = 0.6, targetRotationY = 0;
+        
+        let gameTime = 20 * 60;
+        const timeSpeed = 20; 
+        let scoreBlue = 0, scoreRed = 0;
+
+        const players = [];
+        let blueTarget, redTarget;
+        
+        // 物理常數
+        const gravity = 40; 
+        const bounceRestitution = 0.65; 
+        const friction = 0.96; 
+
+        const ballObj = {
+            mesh: null,
+            state: 'FREE', 
+            velocity: new THREE.Vector3(0, 0, 0),
+            owner: null,
+            radius: 0.6,
+            isLive: false 
+        };
+
+        // 場地邊界定義
+        const courtBounds = {
+            blueInner: { minX: -38, maxX: -2, minZ: -23, maxZ: 23 },
+            redInner:  { minX: 2, maxX: 38, minZ: -23, maxZ: 23 }
+        };
+
+        // 外場Ｕ型區
+        const outerZones = {
+            blue: [
+                { minX: 40, maxX: 48, minZ: -33, maxZ: 33 }, // 後方
+                { minX: 0, maxX: 40, minZ: -33, maxZ: -25 }, // 側邊(上)
+                { minX: 0, maxX: 40, minZ: 25, maxZ: 33 }    // 側邊(下)
+            ],
+            red: [
+                { minX: -48, maxX: -40, minZ: -33, maxZ: 33 }, // 後方
+                { minX: -40, maxX: 0, minZ: -33, maxZ: -25 },  // 側邊(上)
+                { minX: -40, maxX: 0, minZ: 25, maxZ: 33 }     // 側邊(下)
+            ]
+        };
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x111111);
+            clock = new THREE.Clock();
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            resetCamera();
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(20, 80, 20);
+            dirLight.castShadow = true;
+            dirLight.shadow.camera.top = 50; dirLight.shadow.camera.bottom = -50;
+            dirLight.shadow.camera.left = -60; dirLight.shadow.camera.right = 60;
+            scene.add(dirLight);
+
+            const floorGeo = new THREE.PlaneGeometry(110, 80);
+            const floorMat = new THREE.MeshPhongMaterial({ color: 0x273c50 });
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            createCourtLines();
+
+            for(let i=0; i<7; i++) createPlayer("blue", "inner");
+            createPlayer("blue", "outer"); 
+            
+            for(let i=0; i<8; i++) createPlayer("red", "inner");
+            createPlayer("red", "outer"); 
+
+            const blueInners = players.filter(p => p.team === 'blue' && p.role === 'inner');
+            const redInners = players.filter(p => p.team === 'red' && p.role === 'inner');
+            blueTarget = blueInners[Math.floor(Math.random() * blueInners.length)];
+            redTarget = redInners[Math.floor(Math.random() * redInners.length)];
+            blueTarget.isAssassinationTarget = true;
+            redTarget.isAssassinationTarget = true;
+
+            createBall();
+            assignInitialBall(blueInners, redInners);
+            createCones();
+
+            window.addEventListener('mousedown', (e) => { 
+                if(e.target.tagName !== 'BUTTON') { isMouseDown = true; mouseX = e.clientX; mouseY = e.clientY; }
+            });
+            window.addEventListener('mouseup', () => isMouseDown = false);
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('wheel', onMouseWheel);
+            window.addEventListener('resize', onResize);
+
+            animate();
+        }
+
+        function createCourtLines() {
+            const material = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8 });
+            const outerMaterialBlue = new THREE.LineBasicMaterial({ color: 0x4d94ff, transparent: true, opacity: 0.5 }); 
+            const outerMaterialRed = new THREE.LineBasicMaterial({ color: 0xff4d4d, transparent: true, opacity: 0.5 }); 
+            
+            scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(0, 0.1, -33), new THREE.Vector3(0, 0.1, 33)
+            ]), material));
+
+            scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(-38, 0.1, -23), new THREE.Vector3(38, 0.1, -23),
+                new THREE.Vector3(38, 0.1, 23), new THREE.Vector3(-38, 0.1, 23),
+                new THREE.Vector3(-38, 0.1, -23)
+            ]), material));
+
+            outerZones.blue.forEach(z => {
+                scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(z.minX, 0.1, z.minZ), new THREE.Vector3(z.maxX, 0.1, z.minZ),
+                    new THREE.Vector3(z.maxX, 0.1, z.maxZ), new THREE.Vector3(z.minX, 0.1, z.maxZ),
+                    new THREE.Vector3(z.minX, 0.1, z.minZ)
+                ]), outerMaterialBlue));
+            });
+
+            outerZones.red.forEach(z => {
+                scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+                    new THREE.Vector3(z.minX, 0.1, z.minZ), new THREE.Vector3(z.maxX, 0.1, z.minZ),
+                    new THREE.Vector3(z.maxX, 0.1, z.maxZ), new THREE.Vector3(z.minX, 0.1, z.maxZ),
+                    new THREE.Vector3(z.minX, 0.1, z.minZ)
+                ]), outerMaterialRed));
+            });
+        }
+
+        function getRandomOuterPos(team) {
+            const zones = outerZones[team];
+            const z = zones[Math.floor(Math.random() * zones.length)];
+            return new THREE.Vector3(
+                z.minX + Math.random() * (z.maxX - z.minX),
+                0,
+                z.minZ + Math.random() * (z.maxZ - z.minZ)
+            );
+        }
+
+        function createPlayer(team, role) {
+            const group = new THREE.Group();
+            const color = team === 'blue' ? 0x4d94ff : 0xff4d4d;
+            
+            const body = new THREE.Mesh(new THREE.BoxGeometry(1.2, 2.5, 1.2), new THREE.MeshPhongMaterial({ color: color }));
+            body.position.y = 1.25; body.castShadow = true;
+            group.add(body);
+            
+            const head = new THREE.Mesh(new THREE.SphereGeometry(0.6, 16, 16), new THREE.MeshPhongMaterial({ color: 0xffdbac }));
+            head.position.y = 3.1; head.castShadow = true;
+            group.add(head);
+
+            let pos;
+            if (role === 'inner') {
+                const bounds = courtBounds[team + 'Inner'];
+                pos = new THREE.Vector3(
+                    bounds.minX + Math.random() * (bounds.maxX - bounds.minX), 0,
+                    bounds.minZ + Math.random() * (bounds.maxZ - bounds.minZ)
+                );
+            } else {
+                pos = getRandomOuterPos(team);
+            }
+            
+            group.position.copy(pos);
+            scene.add(group);
+
+            players.push({
+                mesh: group, team: team, role: role, state: 'IDLE',
+                targetPos: pos.clone(), speed: 9 + Math.random() * 5,
+                cooldown: 0, isAssassinationTarget: false
+            });
+        }
+
+        function createBall() {
+            const ballGeo = new THREE.SphereGeometry(ballObj.radius, 20, 20);
+            const ballMat = new THREE.MeshPhongMaterial({ color: 0xffff00, emissive: 0x555500 });
+            ballObj.mesh = new THREE.Mesh(ballGeo, ballMat);
+            ballObj.mesh.castShadow = true;
+            scene.add(ballObj.mesh);
+        }
+
+        function assignInitialBall(blueInners, redInners) {
+            let startingTeam = blueInners.length <= redInners.length ? 'blue' : 'red';
+            let starter = (startingTeam === 'blue' ? blueInners : redInners)[0];
+            
+            ballObj.state = 'HELD';
+            ballObj.owner = starter;
+            starter.state = 'AIMING';
+            starter.cooldown = 2.0; 
+        }
+
+        function createCones() {
+            const coneGeo = new THREE.ConeGeometry(0.5, 1.2, 16);
+            const coneMat = new THREE.MeshPhongMaterial({ color: 0xffa500 });
+            const positions = [
+                [-38, -23], [38, -23], [-38, 23], [38, 23], 
+                [-48, -33], [48, -33], [-48, 33], [48, 33]  
+            ];
+            positions.forEach(p => {
+                const cone = new THREE.Mesh(coneGeo, coneMat);
+                cone.position.set(p[0], 0.6, p[1]);
+                cone.castShadow = true;
+                scene.add(cone);
+            });
+        }
+
+        // 簡化且無死角的找球區域判定
+        function getBallZone(bx, bz) {
+            if (bx >= -38 && bx <= -2 && bz >= -23 && bz <= 23) return 'blueInner';
+            if (bx >= 2 && bx <= 38 && bz >= -23 && bz <= 23) return 'redInner';
+            
+            // 如果不在內場，就一定在外場區（右半為藍隊外場，左半為紅隊外場）
+            if (bx >= 0) return 'blueOuter';
+            return 'redOuter';
+        }
+
+        // 核心：物理空氣牆限制，防止球員越界
+        function enforceBoundaries(p) {
+            if (p.role === 'inner') {
+                // 內場不可出界
+                let b = courtBounds[p.team + 'Inner'];
+                p.mesh.position.x = Math.max(b.minX, Math.min(b.maxX, p.mesh.position.x));
+                p.mesh.position.z = Math.max(b.minZ, Math.min(b.maxZ, p.mesh.position.z));
+            } else {
+                // 外場Ｕ型夾攻區限制：絕對無法進入敵方內場
+                if (p.team === 'blue') {
+                    // 藍隊外場基本大框
+                    p.mesh.position.x = Math.max(0, Math.min(48, p.mesh.position.x));
+                    p.mesh.position.z = Math.max(-33, Math.min(33, p.mesh.position.z));
+                    // 挖空紅隊內場區域 (遇到紅隊內場邊界時，沿著邊線滑行)
+                    if (p.mesh.position.x < 40) {
+                        if (p.mesh.position.z > 0 && p.mesh.position.z < 25) p.mesh.position.z = 25;
+                        if (p.mesh.position.z <= 0 && p.mesh.position.z > -25) p.mesh.position.z = -25;
+                    }
+                } else if (p.team === 'red') {
+                    // 紅隊外場基本大框
+                    p.mesh.position.x = Math.max(-48, Math.min(0, p.mesh.position.x));
+                    p.mesh.position.z = Math.max(-33, Math.min(33, p.mesh.position.z));
+                    // 挖空藍隊內場區域
+                    if (p.mesh.position.x > -40) {
+                        if (p.mesh.position.z > 0 && p.mesh.position.z < 25) p.mesh.position.z = 25;
+                        if (p.mesh.position.z <= 0 && p.mesh.position.z > -25) p.mesh.position.z = -25;
+                    }
+                }
+            }
+        }
+
+        function updatePhysicsAndAI(dt) {
+            if (ballObj.state === 'THROWN' || ballObj.state === 'BOUNCING') {
+                ballObj.mesh.position.addScaledVector(ballObj.velocity, dt);
+                ballObj.velocity.y -= gravity * dt;
+                ballObj.mesh.rotation.x += ballObj.velocity.length() * dt;
+
+                if (ballObj.mesh.position.y <= ballObj.radius) {
+                    ballObj.mesh.position.y = ballObj.radius;
+                    if (ballObj.state === 'THROWN') {
+                        ballObj.state = 'BOUNCING';
+                        ballObj.isLive = false;
+                        document.getElementById('status-msg').innerText = "球落地彈跳中... 爭搶自由球！";
+                    }
+                    ballObj.velocity.y = Math.abs(ballObj.velocity.y) * bounceRestitution;
+                    ballObj.velocity.x *= friction;
+                    ballObj.velocity.z *= friction;
+
+                    if (ballObj.velocity.lengthSq() < 2.5 && ballObj.mesh.position.y <= ballObj.radius + 0.1) {
+                        ballObj.state = 'FREE';
+                        ballObj.velocity.set(0,0,0);
+                        ballObj.mesh.position.y = ballObj.radius;
+                    }
+                }
+
+                if (Math.abs(ballObj.mesh.position.x) > 48) { ballObj.velocity.x *= -0.8; ballObj.mesh.position.x = ballObj.mesh.position.x > 0 ? 47.9 : -47.9; }
+                if (Math.abs(ballObj.mesh.position.z) > 33) { ballObj.velocity.z *= -0.8; ballObj.mesh.position.z = ballObj.mesh.position.z > 0 ? 32.9 : -32.9; }
+
+                if (ballObj.state === 'THROWN' && ballObj.isLive) {
+                    for (let p of players) {
+                        if (p.team !== ballObj.owner.team && p.role === 'inner') {
+                            const dx = ballObj.mesh.position.x - p.mesh.position.x;
+                            const dz = ballObj.mesh.position.z - p.mesh.position.z;
+                            if (dx*dx + dz*dz < 2.25 && ballObj.mesh.position.y < 3.5 && ballObj.mesh.position.y > 0) {
+                                
+                                p.role = 'outer'; // 擊中淘汰至外場
+                                p.targetPos.copy(getRandomOuterPos(p.team));
+
+                                ballObj.state = 'BOUNCING';
+                                ballObj.isLive = false;
+                                ballObj.velocity.x *= -0.4;
+                                ballObj.velocity.z *= -0.4;
+                                ballObj.velocity.y = 12; 
+                                
+                                const pts = p.isAssassinationTarget ? 3 : 1;
+                                if(ballObj.owner.team === 'blue') scoreBlue += pts; else scoreRed += pts;
+                                document.getElementById('score-blue').innerText = scoreBlue;
+                                document.getElementById('score-red').innerText = scoreRed;
+                                
+                                // ★ 復活機制 ★ 
+                                if (ballObj.owner.role === 'outer') {
+                                    ballObj.owner.role = 'inner'; // 轉為內場
+                                    let b = courtBounds[ballObj.owner.team + 'Inner'];
+                                    ballObj.owner.targetPos.set(b.minX + Math.random()*(b.maxX-b.minX), 0, b.minZ + Math.random()*(b.maxZ-b.minZ));
+                                    
+                                    document.getElementById('status-msg').innerText = `🎉 漂亮擊殺！${ballObj.owner.team==='blue'?'藍':'紅'}隊外場觸發【復活機制】回歸內場！`;
+                                } else {
+                                    document.getElementById('status-msg').innerText = p.isAssassinationTarget ? "🔥 暗殺目標被擊中！(+3分) 球反彈！" : "💥 擊中！球員淘汰至外場！";
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            const currentBallZone = getBallZone(ballObj.mesh.position.x, ballObj.mesh.position.z);
+
+            players.forEach(p => {
+                if(p.cooldown > 0) p.cooldown -= dt;
+                
+                let bZone = p.team + (p.role === 'inner' ? 'Inner' : 'Outer');
+                
+                if ((ballObj.state === 'FREE' || ballObj.state === 'BOUNCING') && bZone === currentBallZone && ballObj.mesh.position.y < 1.5) {
+                    p.state = 'CHASING_BALL';
+                    p.targetPos.copy(ballObj.mesh.position);
+                    p.targetPos.y = 0;
+                } 
+                else if (ballObj.state === 'HELD' && ballObj.owner === p) {
+                    p.state = 'AIMING';
+                }
+                else if (ballObj.state === 'THROWN' && ballObj.owner.team !== p.team && p.role === 'inner') {
+                    p.state = 'DODGING';
+                    if(p.cooldown <= 0) {
+                        const bounds = courtBounds[p.team + 'Inner'];
+                        p.targetPos.set(bounds.minX + Math.random()*(bounds.maxX-bounds.minX), 0, bounds.minZ + Math.random()*(bounds.maxZ-bounds.minZ));
+                        p.cooldown = 0.6; 
+                    }
+                }
+                else {
+                    p.state = 'IDLE';
+                    if (p.mesh.position.distanceTo(p.targetPos) < 1.0 || p.cooldown <= 0) {
+                        if (p.role === 'inner') {
+                            const bounds = courtBounds[p.team + 'Inner'];
+                            p.targetPos.set(bounds.minX + Math.random()*(bounds.maxX-bounds.minX), 0, bounds.minZ + Math.random()*(bounds.maxZ-bounds.minZ));
+                        } else {
+                            p.targetPos.copy(getRandomOuterPos(p.team));
+                        }
+                        p.cooldown = 1.5 + Math.random() * 2.5;
+                    }
+                }
+
+                // 物理移動
+                const distToTarget = p.mesh.position.distanceTo(p.targetPos);
+                if (distToTarget > 0.5) {
+                    const dir = new THREE.Vector3().subVectors(p.targetPos, p.mesh.position).normalize();
+                    p.mesh.position.addScaledVector(dir, p.speed * dt);
+                    
+                    // ★ 嚴格呼叫邊界鎖定，確保外場不能踩進內場，內場也不會踩出去 ★
+                    enforceBoundaries(p);
+
+                    // 確保看著目標方向(若被邊界阻擋，仍看著想去的方向)
+                    const lookAtPos = p.mesh.position.clone().add(dir);
+                    p.mesh.lookAt(lookAtPos.x, p.mesh.position.y, lookAtPos.z);
+                }
+
+                if (p.state === 'CHASING_BALL' && (ballObj.state === 'FREE' || ballObj.state === 'BOUNCING') && p.mesh.position.distanceTo(ballObj.mesh.position) < 2.0) {
+                    ballObj.state = 'HELD';
+                    ballObj.isLive = false;
+                    ballObj.owner = p;
+                    p.cooldown = 1.0; 
+                }
+
+                if (p.state === 'AIMING' && p.cooldown <= 0) {
+                    const enemies = players.filter(e => e.team !== p.team && e.role === 'inner');
+                    if (enemies.length > 0) {
+                        const targetEnemy = enemies[Math.floor(Math.random() * enemies.length)];
+                        p.mesh.lookAt(targetEnemy.mesh.position.x, p.mesh.position.y, targetEnemy.mesh.position.z);
+                        
+                        const startPos = p.mesh.position.clone(); startPos.y += 2.2;
+                        const endPos = targetEnemy.mesh.position.clone();
+                        endPos.x += (Math.random() - 0.5) * 3;
+                        endPos.z += (Math.random() - 0.5) * 3;
+
+                        const throwTime = 0.65; 
+                        ballObj.mesh.position.copy(startPos);
+                        ballObj.velocity.x = (endPos.x - startPos.x) / throwTime;
+                        ballObj.velocity.z = (endPos.z - startPos.z) / throwTime;
+                        ballObj.velocity.y = ((1.0 - startPos.y) + 0.5 * gravity * throwTime * throwTime) / throwTime;
+
+                        ballObj.state = 'THROWN';
+                        ballObj.isLive = true; 
+                        ballObj.owner = p;
+                    } else {
+                        ballObj.state = 'FREE'; 
+                    }
+                }
+
+                if (ballObj.state === 'HELD' && ballObj.owner === p) {
+                    ballObj.mesh.position.set(p.mesh.position.x, p.mesh.position.y + 1.5, p.mesh.position.z);
+                    const forward = new THREE.Vector3(0,0,1).applyQuaternion(p.mesh.quaternion);
+                    ballObj.mesh.position.addScaledVector(forward, 1.2);
+                }
+            });
+        }
+
+        function onMouseMove(e) {
+            if (!isMouseDown) return;
+            targetRotationY -= (e.clientX - mouseX) * 0.01;
+            targetRotationX += (e.clientY - mouseY) * 0.01;
+            targetRotationX = Math.max(0.1, Math.min(Math.PI / 2.2, targetRotationX));
+            mouseX = e.clientX; mouseY = e.clientY;
+        }
+
+        function onMouseWheel(e) {
+            const distance = camera.position.length() + (e.deltaY > 0 ? 5 : -5);
+            if (distance > 20 && distance < 180) camera.position.setLength(distance);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.1);
+
+            if (gameTime > 0) {
+                gameTime -= dt * timeSpeed;
+                let mins = Math.max(0, Math.floor(gameTime / 60));
+                let secs = Math.max(0, Math.floor(gameTime % 60));
+                document.getElementById('timer').innerText = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                
+                updatePhysicsAndAI(dt);
+            } else {
+                document.getElementById('timer').innerText = "00:00";
+                document.getElementById('timer').style.color = "red";
+                document.getElementById('status-msg').innerText = "比賽時間終了！";
+            }
+
+            const d = camera.position.length();
+            camera.position.x = d * Math.sin(targetRotationY) * Math.cos(targetRotationX);
+            camera.position.y = d * Math.sin(targetRotationX);
+            camera.position.z = d * Math.cos(targetRotationY) * Math.cos(targetRotationX);
+            camera.lookAt(0, 0, 0);
+
+            renderer.render(scene, camera);
+        }
+
+        function toggleShrink() {
+            isShrunk = !isShrunk;
+            document.getElementById('phase-text').innerText = isShrunk ? "第三階段：殊死戰 (無邊界)" : "第二階段：分組對抗";
+            document.getElementById('phase-text').style.color = isShrunk ? "#ff4d4d" : "#ffd700";
+        }
+
+        function highlightTargets() {
+            const createRing = (player) => {
+                if(player.role === 'outer') return;
+                const ringGeo = new THREE.RingGeometry(1.6, 2.0, 32);
+                const color = player.team === 'blue' ? 0x4d94ff : 0xff4d4d;
+                const ringMat = new THREE.MeshBasicMaterial({ color: color, side: THREE.DoubleSide });
+                const ring = new THREE.Mesh(ringGeo, ringMat);
+                ring.rotation.x = Math.PI/2;
+                ring.position.y = 0.1;
+                player.mesh.add(ring);
+                
+                let blink = 0;
+                const interval = setInterval(() => {
+                    ring.visible = !ring.visible;
+                    if(++blink > 14) { clearInterval(interval); player.mesh.remove(ring); }
+                }, 250);
+            };
+
+            createRing(blueTarget);
+            createRing(redTarget);
+        }
+
+        function resetCamera() {
+            camera.position.set(0, 70, 110);
+            targetRotationX = 0.6; targetRotationY = 0;
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
